@@ -1,8 +1,10 @@
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "hardware/adc.h"
 #include "hardware/i2c.h"
+#include "hardware/watchdog.h"
 #include "pico/stdlib.h"
 
 // Project Headers
@@ -11,103 +13,240 @@
 #include "pico_internal.h"
 #include "pico_rtc.h"
 
-// I2C Configuration
+// --- CONFIGURATION ---
 #define I2C_PORT i2c0
 #define SDA_PIN 4
 #define SCL_PIN 5
+#define RELAY_PIN 15
+#define BUTTON_PIN 14
 
-void run_i2c_scan() {
-  printf("\n--- Scanning I2C Bus ---\n");
-  printf("   0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F\n");
-  for (int addr = 0; addr < (1 << 7); ++addr) {
-    if (addr % 16 == 0) printf("%02x ", addr);
+// Thresholds
+#define MOIST_DRY_THRESHOLD 30.0f
+#define MOIST_WET_THRESHOLD 60.0f
+#define SENSOR_MIN_HEALTHY 0.5f  // Below this, we assume the wire is unplugged
 
-    // Skip reserved addresses
-    if ((addr & 0x78) == 0 || (addr & 0x78) == 0x78) {
-      printf("   ");
-      continue;
-    }
+// Timers (ms)
+#define MAX_PUMP_RUN_TIME_MS 20000  // 20 sec safety cutoff
+#define SOAK_COOLDOWN_MS 15000      // 15 sec wait for water to sink in
+#define DISPLAY_UPDATE_MS 500       // Refresh screen 2x per second
+#define PAGE_SWITCH_MS 4000         // Switch LCD pages every 4 seconds
+#define WATCHDOG_TIMEOUT_MS 5000    // Reboot if frozen for 5 seconds
 
-    uint8_t rxdata;
-    // 10ms timeout to prevent hanging
-    int ret = i2c_read_timeout_us(I2C_PORT, addr, &rxdata, 1, false, 10000);
+// --- SYSTEM STATES ---
+typedef enum {
+  SYSTEM_IDLE,
+  SYSTEM_WATERING_AUTO,
+  SYSTEM_WATERING_MANUAL,
+  SYSTEM_SOAKING,
+  SYSTEM_ERROR_TIMEOUT,
+  SYSTEM_ERROR_SENSOR
+} system_state_t;
 
-    if (ret >= 0)
-      printf("%02x ", addr);
-    else
-      printf("-- ");
+// --- GLOBALS ---
+system_state_t current_state = SYSTEM_IDLE;
+uint32_t pump_start_time = 0;
+uint32_t last_pump_end_time = 0;
 
-    if (addr % 16 == 15) printf("\n");
+// Rolling Average Buffer (Filters out electronic noise)
+#define AVG_SAMPLES 20
+float moisture_buffer[AVG_SAMPLES];
+int buf_idx = 0;
+
+float get_stable_moisture(float new_sample) {
+  moisture_buffer[buf_idx] = new_sample;
+  buf_idx = (buf_idx + 1) % AVG_SAMPLES;
+  float sum = 0;
+  for (int i = 0; i < AVG_SAMPLES; i++) sum += moisture_buffer[i];
+  return sum / (float)AVG_SAMPLES;
+}
+
+const char* get_status_str(system_state_t state) {
+  switch (state) {
+    case SYSTEM_IDLE:
+      return "Status: Ready  ";
+    case SYSTEM_WATERING_AUTO:
+      return "Mode: Pumping  ";
+    case SYSTEM_WATERING_MANUAL:
+      return "Mode: Manual   ";
+    case SYSTEM_SOAKING:
+      return "Status: Soaking";
+    case SYSTEM_ERROR_TIMEOUT:
+      return "ERR: TIMEOUT   ";
+    case SYSTEM_ERROR_SENSOR:
+      return "ERR: NO SENSOR ";
+    default:
+      return "Unknown        ";
   }
-  printf("--- Scan Finished ---\n\n");
 }
 
 int main() {
-  // 1. Initialize all standard I/O
+  // 1. Initialize Standard I/O
   stdio_init_all();
 
-  // 2. CRITICAL: Wait for USB Serial to connect
-  // This prevents you from missing the I2C scan results in your terminal
-  sleep_ms(2000);
-  printf("\n[SYSTEM] Booting Raspberry Pi Pico...\n");
+  // 2. Safety: Enable Hardware Watchdog
+  // If the loop freezes for more than 5 seconds, the Pico hardware reboots
+  watchdog_enable(WATCHDOG_TIMEOUT_MS, 1);
 
-  // 3. Initialize RTC and ADC
-  internal_rtc_init(2026, 3, 9, 21, 48);
+  // Wait for USB Serial connection
+  sleep_ms(2000);
+
+  printf("[SYSTEM] Smart Watering v3.3 Booting...\n");
+
+  // NEW CLEAN CALL: No arguments needed!
+  internal_rtc_init_from_compiler();
+
   adc_init();
   adc_set_temp_sensor_enabled(true);
-
-  // Initialize our custom moisture sensor module
   moisture_sensor_init();
 
-  // 4. Initialize I2C Bus
-  i2c_init(I2C_PORT, 100 * 1000);  // Start at 100kHz for stability
+  // Relay (Pump) Init
+  gpio_init(RELAY_PIN);
+  gpio_set_dir(RELAY_PIN, GPIO_OUT);
+  gpio_put(RELAY_PIN, 0);
+
+  // Button Init
+  gpio_init(BUTTON_PIN);
+  gpio_set_dir(BUTTON_PIN, GPIO_IN);
+  gpio_pull_up(BUTTON_PIN);
+
+  // I2C & LCD Init
+  i2c_init(I2C_PORT, 100 * 1000);
   gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
   gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
   gpio_pull_up(SDA_PIN);
   gpio_pull_up(SCL_PIN);
-
-  // 5. Run I2C Scan (Check terminal for the LCD address!)
-  run_i2c_scan();
-
-  // 6. Initialize LCD
   lcd_init();
 
-  char lcd_line1_buff[17];
-  char lcd_line2_buff[17];
-  char datetime_buf[256];
+  // Pre-fill buffer with initial reading
+  float initial_read = moisture_sensor_read_percent(moisture_sensor_read_raw());
+  for (int i = 0; i < AVG_SAMPLES; i++) moisture_buffer[i] = initial_read;
 
-  printf("[SYSTEM] Entering Main Loop...\n");
+  char line1[17], line2[17], time_str[64];
+  uint32_t last_display_time = 0;
+  uint32_t last_page_switch = 0;
+  int display_page = 0;
 
   while (true) {
-    // --- STEP A: READ INTERNAL CHIP TEMPERATURE ---
+    // Feed the watchdog to prove the code is still running
+    watchdog_update();
+
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+
+    // --- STEP A: SENSORS (Non-blocking) ---
+    float raw_val = moisture_sensor_read_percent(moisture_sensor_read_raw());
+    float moisture_per = get_stable_moisture(raw_val);
+
     adc_select_input(4);
-    sleep_us(500);     // Allow mux to settle
-    (void)adc_read();  // Discard first reading
     float chip_temp = get_chip_temperature();
+    bool btn = !gpio_get(BUTTON_PIN);  // Button is Active Low
 
-    // --- STEP B: READ MOISTURE SENSOR ---
-    // moisture_sensor_read_raw() already handles its own settling and averaging
-    uint16_t raw_m = moisture_sensor_read_raw();
-    float moisture_per = moisture_sensor_read_percent(raw_m);
+    // --- STEP B: LOGIC STATE MACHINE ---
 
-    // --- STEP C: SERIAL OUTPUT ---
-    get_timestamp(datetime_buf, sizeof(datetime_buf));
-    printf("[%s] Temp: %.2f C | Moist: %.1f%% (Raw: %d)\n", datetime_buf, chip_temp, moisture_per, raw_m);
+    // Sensor Health Check: If moisture is exactly 0.0%, assume hardware failure
+    if (moisture_per < SENSOR_MIN_HEALTHY && current_state != SYSTEM_ERROR_TIMEOUT) {
+      current_state = SYSTEM_ERROR_SENSOR;
+    }
 
-    // --- STEP D: LCD OUTPUT ---
-    // Line 1: Chip Temperature
-    snprintf(lcd_line1_buff, sizeof(lcd_line1_buff), "Chip: %.1f C   ", chip_temp);
-    lcd_set_cursor(0, 0);
-    lcd_string(lcd_line1_buff);
+    switch (current_state) {
+      case SYSTEM_IDLE:
+        gpio_put(RELAY_PIN, 0);
+        if (btn) {
+          current_state = SYSTEM_WATERING_MANUAL;
+          pump_start_time = now;
+        } else if (moisture_per < MOIST_DRY_THRESHOLD) {
+          // Check if we are still in the soak/cooldown period
+          if (now - last_pump_end_time > SOAK_COOLDOWN_MS) {
+            current_state = SYSTEM_WATERING_AUTO;
+            pump_start_time = now;
+          } else {
+            current_state = SYSTEM_SOAKING;
+          }
+        }
+        break;
 
-    // Line 2: Moisture Percentage
-    snprintf(lcd_line2_buff, sizeof(lcd_line2_buff), "Moist: %.1f%%   ", moisture_per);
-    lcd_set_cursor(1, 0);
-    lcd_string(lcd_line2_buff);
+      case SYSTEM_SOAKING:
+        gpio_put(RELAY_PIN, 0);
+        if (now - last_pump_end_time > SOAK_COOLDOWN_MS) current_state = SYSTEM_IDLE;
+        if (btn) {
+          current_state = SYSTEM_WATERING_MANUAL;
+          pump_start_time = now;
+        }
+        break;
 
-    // Wait 1 second before next reading
-    sleep_ms(1000);
+      case SYSTEM_WATERING_AUTO:
+        gpio_put(RELAY_PIN, 1);
+        // SUCCESS: Watered until wet threshold
+        if (moisture_per > MOIST_WET_THRESHOLD) {
+          current_state = SYSTEM_IDLE;
+          last_pump_end_time = now;
+        }
+        // SAFETY: Stop if it takes too long
+        else if (now - pump_start_time > MAX_PUMP_RUN_TIME_MS) {
+          current_state = SYSTEM_ERROR_TIMEOUT;
+          last_pump_end_time = now;
+        }
+        break;
+
+      case SYSTEM_WATERING_MANUAL:
+        gpio_put(RELAY_PIN, 1);
+        if (!btn) {
+          current_state = SYSTEM_IDLE;
+          last_pump_end_time = now;
+        }
+        if (now - pump_start_time > MAX_PUMP_RUN_TIME_MS) {
+          current_state = SYSTEM_ERROR_TIMEOUT;
+          last_pump_end_time = now;
+        }
+        break;
+
+      case SYSTEM_ERROR_TIMEOUT:
+      case SYSTEM_ERROR_SENSOR:
+        gpio_put(RELAY_PIN, 0);
+        if (btn) {        // A button press resets the error
+          sleep_ms(500);  // Debounce
+          current_state = SYSTEM_IDLE;
+          last_pump_end_time = now;
+        }
+        break;
+    }
+
+    // --- STEP C: OUTPUT (LCD & SERIAL) ---
+    if (now - last_display_time > DISPLAY_UPDATE_MS) {
+      last_display_time = now;
+
+      // Switch LCD pages every X seconds
+      if (now - last_page_switch > PAGE_SWITCH_MS) {
+        display_page = (display_page + 1) % 2;
+        last_page_switch = now;
+        lcd_clear();  // Clear to prevent artifacts
+      }
+
+      if (display_page == 0) {
+        // PAGE 0: Moisture and System Status
+        snprintf(line1, sizeof(line1), "Moisture: %.1f%% ", moisture_per);
+        snprintf(line2, sizeof(line2), "%-16s", get_status_str(current_state));
+      } else {
+        // PAGE 1: Temperature and Time
+        get_timestamp(time_str, sizeof(time_str));
+
+        // Robust Time Extraction (HH:MM:SS)
+        char* first_colon = strchr(time_str, ':');
+        char* display_time = (first_colon) ? (first_colon - 2) : "--:--:--";
+
+        snprintf(line1, sizeof(line1), "Temp: %.1f C   ", chip_temp);
+        snprintf(line2, sizeof(line2), "Time: %.8s   ", display_time);
+      }
+
+      lcd_set_cursor(0, 0);
+      lcd_string(line1);
+      lcd_set_cursor(1, 0);
+      lcd_string(line2);
+
+      // Serial Monitor Logging
+      printf("[%s] Moist:%.1f%% State:%s Temp:%.1fC\n", time_str, moisture_per, get_status_str(current_state), chip_temp);
+    }
+
+    // 20ms delay makes the button feel very responsive
+    sleep_ms(20);
   }
-
-  return 0;
 }
